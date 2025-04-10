@@ -153,9 +153,8 @@ def train_recall_model(test_df, item_df, output_dir, args):
         per_device_train_batch_size=args.batch_size,
         num_train_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
-        # warmup_ratio=0.05,
-        # lr_scheduler_type="cosine",
-        lr_scheduler_type="constant",
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler_type,
         save_strategy="epoch",
         logging_dir=os.path.join(output_dir, "logs"),
         logging_steps=10,
@@ -201,8 +200,66 @@ def main():
     # train_df = train_df[:1024]
     # test_df = test_df[:1024]
     
-    trainer = train_recall_model(train_df, item_df, "/mnt/data/LLM4Rec/model/fine-tune/Qwen2.5-0.5B/constant/4epoch", args)
+    save_dir = f"/mnt/data/LLM4Rec/model/fine-tune/Qwen2.5-0.5B/{args.lr_scheduler_type}/{str(args.num_epochs)}epoch_{str(args.learning_rate)}"
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+    trainer = train_recall_model(train_df, item_df, save_dir, args)
     print("==================================  Finish Fine-tuning  ==================================")
+    
+    
+    
+    import os
+    import torch
+    import logging
+    import numpy as np
+    import pandas as pd
+    from modelscope import AutoModelForCausalLM, AutoTokenizer
+    from utils import generate_item_embs, generate_user_embs, compute_hit_rate, build_faiss_index_from_embeddings, setup_logger
+    
+    checkpoints_dir = save_dir
+    checkpoint_numbers = range(9211, 9211*args.num_epochs+1, 9211)  # 9211, 18422, ..., 92110
+    checkpoint_paths = [os.path.join(checkpoints_dir, f"checkpoint-{num}") for num in checkpoint_numbers]
+    
+    for i in range(args.num_epochs):
+        logger = setup_logger(checkpoint_paths[i])
+        model = AutoModelForCausalLM.from_pretrained(checkpoint_paths[i])
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint_paths[i])
+        model.to('cuda')
+
+        item_index_ids, item_embs = generate_item_embs(
+            df=item_df,
+            model=model,
+            tokenizer=tokenizer,
+            device='cuda',
+            batch_size=128,
+            use_amp=True
+        )
+
+        index, index_id_map = build_faiss_index_from_embeddings(
+            index_id_map=item_index_ids,
+            embeddings=item_embs,
+        )
+        index.nprobe = 800
+
+        user_index_ids, user_embs = generate_user_embs(
+            df=test_df,
+            model=model,
+            tokenizer=tokenizer,
+            device='cuda',
+            batch_size=32,
+            use_amp=True
+        )
+        
+        hit_rate, sampled_recalls = compute_hit_rate(
+            user_embs=user_embs,
+            user_index_ids=user_index_ids,
+            index=index,
+            index_id_map=index_id_map,
+            gt_mapping=test_df['item_id'].to_numpy(),
+            top_k=200,
+            batch_size=512
+        )
+        
+        logging.info(f"Hit Rate @200: {hit_rate:.4f}")
     
 
 if __name__ == "__main__":
