@@ -69,7 +69,7 @@ class RecallDataCollator:
 
         return {
             'user_inputs': user_inputs,
-            'pos_item_inputs': item_inputs
+            'item_inputs': item_inputs
         }
     
 class RecallTrainer(Trainer):
@@ -82,42 +82,36 @@ class RecallTrainer(Trainer):
         user_embs = user_outputs.hidden_states[-1].mean(dim=1)
         # outputs.hidden_states[-1][:, -1, :]  TODO
 
-        pos_outputs = model(
-            input_ids=inputs["pos_item_inputs"]["input_ids"],
-            attention_mask=inputs["pos_item_inputs"]["attention_mask"],
+        item_outputs = model(
+            input_ids=inputs["item_inputs"]["input_ids"],
+            attention_mask=inputs["item_inputs"]["attention_mask"],
             output_hidden_states=True
         )
-        pos_embs = pos_outputs.hidden_states[-1].mean(dim=1)
+        item_embs = item_outputs.hidden_states[-1].mean(dim=1)
         
         # user_embs = F.normalize(user_embs, p=2, dim=-1)  # [B, D]
-        # pos_embs = F.normalize(pos_embs, p=2, dim=-1)    # [B, D]
+        # item_embs = F.normalize(item_embs, p=2, dim=-1)  # [B, D]
 
-        # 分布式收集所有正样本
+        # 分布式收集所有正/负样本
         if dist.is_initialized():
             world_size = dist.get_world_size()
-            gather_pos = [torch.zeros_like(pos_embs) for _ in range(world_size)]
-            dist.all_gather(gather_pos, pos_embs)
-            all_pos = torch.cat(gather_pos, dim=0)
-            # print(f"Rank {dist.get_rank()}: all_pos.shape={all_pos.shape}")
+            gather_pos = [torch.zeros_like(item_embs) for _ in range(world_size)]
+            dist.all_gather(gather_pos, item_embs)
+            all_embs = torch.cat(gather_pos, dim=0)
+            # print(f"Rank {dist.get_rank()}: all_embs.shape={all_embs.shape}")
         else:
-            all_pos = pos_embs
+            all_embs = item_embs
 
-        # 相似度计算
-        pos_sim = torch.sum(user_embs * pos_embs, dim=-1)  # [B]
-        neg_sim = torch.matmul(user_embs, all_pos.T)  # [B, N*B]
-        
-        logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)  # [batch_size, 1 + num_GPUs × batch_size]
+        logits = torch.matmul(user_embs, all_embs.T)  # [batch_size, num_GPUs*batch_size]
 
         labels = torch.zeros_like(logits)
-        labels[:, 0] = 1.0
-        # 排除自身正样本
         batch_size = user_embs.size(0)
         if dist.is_initialized():
             rank = dist.get_rank()
             mask_idx = torch.arange(rank*batch_size, (rank+1)*batch_size, device=user_embs.device)
         else:
             mask_idx = torch.arange(batch_size, device=user_embs.device)
-        labels[torch.arange(batch_size, device=mask_idx.device), mask_idx] = 1.0
+        labels[torch.arange(batch_size, device=mask_idx.device), mask_idx] = 1.0  # 这些位置为正样本，其余为负样本
 
         # Focal Loss
         bce_loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
@@ -127,7 +121,7 @@ class RecallTrainer(Trainer):
         focal_weight = (1-pt) ** gamma
         loss = (focal_weight * bce_loss).mean()
 
-        return (loss, (user_embs, pos_embs, all_pos, logits)) if return_outputs else loss
+        return (loss, (user_embs, item_embs, all_embs, logits)) if return_outputs else loss
 
 
 def train_recall_model(train_df, item_df, output_dir, args):
@@ -191,20 +185,6 @@ def main():
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     trainer = train_recall_model(train_df, item_df, save_dir, args)
     print("==================================  Finish Fine-tuning  ==================================")
-
-    # 评估（需根据实际情况调整）
-    if args.local_rank in [-1, 0]:  # 仅在主进程评估
-        test_df = pd.read_csv(f"{data_dir}/test.csv")
-        model = trainer.model.cuda()
-        
-        # 生成item embedding
-        item_ids, item_embs = generate_item_embs(item_df, model, trainer.tokenizer, 'cuda', 256)
-        index, id_map = build_faiss_index_from_embeddings(item_ids, item_embs)
-        
-        # 生成user embedding并评估
-        user_ids, user_embs = generate_user_embs(test_df, model, trainer.tokenizer, 'cuda', 64)
-        hit_rate, _ = compute_hit_rate(user_embs, user_ids, index, id_map, test_df['item_id'].values)
-        print(f"Final Hit Rate @200: {hit_rate:.4f}")
 
 
 if __name__ == "__main__":
