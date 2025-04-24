@@ -56,7 +56,7 @@ class RecallDataCollator:
             ] for feat in features
         ]
         user_texts = [self.tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in user_messages]
-        user_inputs = self.tokenizer(user_texts, return_tensors="pt", padding=True, truncation=True, max_length=1024)
+        user_inputs = self.tokenizer(user_texts, return_tensors="pt", padding=True, truncation=True, max_length=4096)
 
         item_messages = [
             [
@@ -65,11 +65,13 @@ class RecallDataCollator:
             ] for feat in features
         ]
         item_texts = [self.tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in item_messages]
-        item_inputs = self.tokenizer(item_texts, return_tensors="pt", padding=True, truncation=True, max_length=1024)
+        item_inputs = self.tokenizer(item_texts, return_tensors="pt", padding=True, truncation=True, max_length=4096)
 
         return {
             'user_inputs': user_inputs,
-            'item_inputs': item_inputs
+            'item_inputs': item_inputs,
+            'user_ids': [feat['sample']['user_id'] for feat in features],
+            'item_ids': [feat['item']['item_id'] for feat in features],
         }
     
 class RecallTrainer(Trainer):
@@ -91,19 +93,45 @@ class RecallTrainer(Trainer):
         
         # user_embs = F.normalize(user_embs, p=2, dim=-1)  # [B, D]
         # item_embs = F.normalize(item_embs, p=2, dim=-1)  # [B, D]
-
-        # 分布式收集所有正/负样本
+        
         if dist.is_initialized():
             world_size = dist.get_world_size()
             gather_pos = [torch.zeros_like(item_embs) for _ in range(world_size)]
             dist.all_gather(gather_pos, item_embs)
             all_embs = torch.cat(gather_pos, dim=0)
-            # print(f"Rank {dist.get_rank()}: all_embs.shape={all_embs.shape}")
+            
+            item_ids_tensor = torch.tensor(inputs["item_ids"], dtype=torch.long, device=item_embs.device)
+            gather_ids = [torch.zeros_like(item_ids_tensor) for _ in range(world_size)]
+            dist.all_gather(gather_ids, item_ids_tensor)
+            all_item_ids = torch.cat(gather_ids, dim=0)
         else:
             all_embs = item_embs
+            all_item_ids = torch.tensor(inputs["item_ids"], dtype=torch.long, device=item_embs.device)
+
+        user_ids = inputs["user_ids"]
+        batch_size = len(user_ids)
+        num_candidates = all_item_ids.size(0)
+
+        labels = torch.zeros(batch_size, num_candidates, device=all_embs.device)
+        for i, user_id in enumerate(user_ids):
+            pos_items = user_pos_items.get(user_id, set())
+            if len(pos_items) > 0:
+                pos_tensor = torch.tensor(list(pos_items), device=all_item_ids.device)
+                mask = torch.isin(all_item_ids, pos_tensor)
+                labels[i, mask] = 1.0
 
         logits = torch.matmul(user_embs, all_embs.T)  # [batch_size, num_GPUs*batch_size]
+        
+        # if dist.is_initialized():
+        #     rank = dist.get_rank()
+        #     # 生成类别标签，每个样本的正样本索引为 rank*batch_size + i
+        #     labels = torch.arange(logits.size(0), device=user_embs.device) + rank * logits.size(0)
+        # else:
+        #     labels = torch.arange(logits.size(0), device=user_embs.device)
 
+        # # Cross Entropy Loss
+        # loss = F.cross_entropy(logits, labels)
+        
         labels = torch.zeros_like(logits)
         batch_size = user_embs.size(0)
         if dist.is_initialized():
@@ -117,8 +145,12 @@ class RecallTrainer(Trainer):
         bce_loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
         probs = torch.sigmoid(logits)
         pt = torch.where(labels.bool(), probs, 1-probs)
+        
         gamma = 2
-        focal_weight = (1-pt) ** gamma
+        alpha = 0.25
+        alpha_t = torch.where(labels.bool(), alpha, 1-alpha)
+        focal_weight = alpha_t * (1 - pt) ** gamma
+
         loss = (focal_weight * bce_loss).mean()
 
         return (loss, (user_embs, item_embs, all_embs, logits)) if return_outputs else loss
