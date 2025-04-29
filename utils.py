@@ -1,13 +1,42 @@
 import os
 import torch
 import faiss
+import datetime
 import logging
-# import deepspeed
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from pathlib import Path
 from modelscope import AutoModelForCausalLM, AutoTokenizer
-from embedding import generate_item_embs, generate_user_embs, save_embeddings, load_embeddings
+
+
+CATEGORY_MAPPING = {
+    'OTHER': '其他',
+    'CHINASTUDIES': '国学',
+    'YOGA': '瑜伽',
+    'ZHONGYI': '中医',
+    'Pilates': '普拉提',
+    'SHORT_VIDEO': '短视频',
+    'PHONE_PHOTOGRAPHY': '手机摄影',
+    'SING': '唱歌',
+    'CHUANDA': '穿搭',
+    'EAT_THIN': '吃瘦',
+    'FIVEFOWLPLAYS': '五禽戏',
+    'Cameraphotography': '相机摄影',
+    'QIXUE_TIAOLI': '气血调理',
+    'LIFE': '生活',
+    'GUQIHUOXUE': '古琴活学',
+    'DANCE': '舞蹈',
+    'ASTROLOGY': '占星',
+    'YIJING': '易经',
+    'ZMGJ': '正面管教',
+    'Videoclip': '视频剪辑',
+    'TAROT': '塔罗',
+    'shequceshileimu': '社区测试类目',
+    np.nan: '未知类别',
+    None: '未知类别',
+    '': '未知类别'
+}
 
 
 def build_faiss_index_from_embeddings(
