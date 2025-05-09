@@ -2,6 +2,7 @@ import os
 import torch
 import logging
 import argparse
+import random
 import torch.distributed as dist
 import torch.nn.functional as F
 import numpy as np
@@ -12,15 +13,15 @@ from ast import literal_eval
 from transformers import Trainer, TrainingArguments
 from modelscope import AutoModelForCausalLM, AutoTokenizer
 from torch.utils.data import Dataset, DataLoader
-from torch.distributed.tensor import DTensor
-from embedding import build_item_prompt, build_user_prompt, generate_item_embs, generate_user_embs
+from embedding import build_item_prompt, build_user_prompt, generate_item_embs, generate_user_embs, SYSTEM_USER_PROMPT, SYSTEM_ITEM_PROMPT
 from utils import compute_hit_rate, build_faiss_index_from_embeddings, setup_logger
 
 
 def init_model(args):
-    model = AutoModelForCausalLM.from_pretrained(f"Qwen/{args.model_name}", torch_dtype="auto", device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(f"Qwen/{args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(f"Qwen/{args.model_name}")
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.add_special_tokens({"additional_special_tokens": ["[USER]", "[ITEM]"]})
+    model.resize_token_embeddings(len(tokenizer))
     return model, tokenizer
 
     
@@ -47,96 +48,108 @@ class RecallDataset(Dataset):
 
 
 class RecallDataCollator:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, item_df, num_negatives=7):
         self.tokenizer = tokenizer
+        self.item_df = item_df
+        self.num_negatives = num_negatives
+        self.all_item_ids = self.item_df.index.tolist()
         
     def __call__(self, features):
+        batch_size = len(features)
+        
         user_messages = [
             [
-                {"role": "system", "content": "在个性化内容推荐场景中，根据用户画像，生成个性化内容推荐。"},
+                {"role": "system", "content": SYSTEM_USER_PROMPT},
                 {"role": "user", "content": build_user_prompt(feat['sample'])}
             ] for feat in features
         ]
         user_texts = [self.tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in user_messages]
-        user_inputs = self.tokenizer(user_texts, return_tensors="pt", padding=True, truncation=True, max_length=4096)
+        user_inputs = self.tokenizer(user_texts, return_tensors="pt", padding=True, truncation=True, max_length=512)
 
-        item_messages = [
+        positive_item_messages = [
             [
-                {"role": "system", "content": "在个性化内容推荐场景中，根据内容信息推断潜在客户信息（如性别、内容偏好等），并向用户推荐。"},
+                {"role": "system", "content": SYSTEM_ITEM_PROMPT},
                 {"role": "user", "content": build_item_prompt(feat['item'])}
             ] for feat in features
         ]
-        item_texts = [self.tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in item_messages]
-        item_inputs = self.tokenizer(item_texts, return_tensors="pt", padding=True, truncation=True, max_length=4096)
-
+        positive_item_texts = [self.tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in positive_item_messages]
+        positive_item_inputs = self.tokenizer(positive_item_texts, return_tensors="pt", padding=True, truncation=True, max_length=256)
+        
+        positive_item_ids = [feat['sample']['item_id'] for feat in features]
+        
+        negative_item_ids = []
+        available_items = [item_id for item_id in self.all_item_ids if item_id not in positive_item_ids]
+        if len(available_items) >= self.num_negatives:
+            negative_item_ids = random.sample(available_items, self.num_negatives)
+        else:
+            negative_item_ids = random.choices(available_items, k=self.num_negatives)
+        
+        negative_items = [self.item_df.loc[item_id] for item_id in negative_item_ids]
+        
+        negative_item_messages = [
+            [
+                {"role": "system", "content": SYSTEM_ITEM_PROMPT},
+                {"role": "user", "content": build_item_prompt(item)}
+            ] for item in negative_items
+        ]
+        negative_item_texts = [self.tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in negative_item_messages]
+        negative_item_inputs = self.tokenizer(negative_item_texts, return_tensors="pt", padding=True, truncation=True, max_length=256)
+        
         return {
             'user_inputs': user_inputs,
-            'item_inputs': item_inputs,
-            'user_ids': [feat['sample']['user_id'] for feat in features],
-            'item_ids': [feat['sample']['item_id'] for feat in features],
+            'positive_item_inputs': positive_item_inputs,
+            'negative_item_inputs': negative_item_inputs,
         }
-    
+
+
 class RecallTrainer(Trainer):
-    def __init__(self, user_pos_items, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.user_pos_items = user_pos_items
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):      
         user_outputs = model(
             input_ids=inputs["user_inputs"]["input_ids"],
             attention_mask=inputs["user_inputs"]["attention_mask"],
             output_hidden_states=True
         )
-        user_embs = user_outputs.hidden_states[-1].mean(dim=1)
-        # outputs.hidden_states[-1][:, -1, :]  TODO
+        user_embs = user_outputs.hidden_states[-1][:, -1, :]  # [B, D] 取序列最后一个token的embedding
+        # user_embs = user_outputs.hidden_states[-1].mean(dim=1)  # [B, D]
 
-        item_outputs = model(
-            input_ids=inputs["item_inputs"]["input_ids"],
-            attention_mask=inputs["item_inputs"]["attention_mask"],
+        # 正样本物品表征提取
+        positive_item_outputs = model(
+            input_ids=inputs["positive_item_inputs"]["input_ids"],
+            attention_mask=inputs["positive_item_inputs"]["attention_mask"],
             output_hidden_states=True
         )
-        item_embs = item_outputs.hidden_states[-1].mean(dim=1)
+        positive_item_embs = positive_item_outputs.hidden_states[-1][:, -1, :]  # [B, D]
+        # positive_item_embs = positive_item_outputs.hidden_states[-1].mean(dim=1)  # [B, D]
+
+        # 负样本物品表征提取
+        negative_item_outputs = model(
+            input_ids=inputs["negative_item_inputs"]["input_ids"],
+            attention_mask=inputs["negative_item_inputs"]["attention_mask"],
+            output_hidden_states=True
+        )
+        negative_item_embs = negative_item_outputs.hidden_states[-1][:, -1, :]  # [N, D]
+        # negative_item_embs = negative_item_outputs.hidden_states[-1].mean(dim=1)  # [N, D]    
         
-        # user_embs = F.normalize(user_embs, p=2, dim=-1)  # [B, D]
-        # item_embs = F.normalize(item_embs, p=2, dim=-1)  # [B, D]
+        # user_embs = F.normalize(user_embs, p=2, dim=-1)
+        # positive_item_embs = F.normalize(positive_item_embs, p=2, dim=-1)
+        # negative_item_embs = F.normalize(negative_item_embs, p=2, dim=-1)
         
-        if dist.is_initialized():
-            world_size = dist.get_world_size()
-            gather_pos = [torch.zeros_like(item_embs) for _ in range(world_size)]
-            dist.all_gather(gather_pos, item_embs)
-            all_embs = torch.cat(gather_pos, dim=0)
-            
-            item_ids_tensor = torch.tensor(inputs["item_ids"], dtype=torch.long, device=item_embs.device)
-            gather_ids = [torch.zeros_like(item_ids_tensor) for _ in range(world_size)]
-            dist.all_gather(gather_ids, item_ids_tensor)
-            all_item_ids = torch.cat(gather_ids, dim=0)
-        else:
-            all_embs = item_embs
-            all_item_ids = torch.tensor(inputs["item_ids"], dtype=torch.long, device=item_embs.device)
-
-        user_ids = inputs["user_ids"]
-        batch_size = len(user_ids)
-        num_candidates = all_item_ids.size(0)
-
-        labels = torch.zeros(batch_size, num_candidates, device=all_embs.device)
-        for i, user_id in enumerate(user_ids):
-            pos_items = self.user_pos_items.get(user_id, set())
-            if len(pos_items) > 0:
-                pos_tensor = torch.tensor(list(pos_items), device=all_item_ids.device)
-                mask = torch.isin(all_item_ids, pos_tensor)
-                labels[i, mask] = 1.0
-
-        logits = torch.matmul(user_embs, all_embs.T)  # [batch_size, num_GPUs*batch_size]
+        batch_size = user_embs.size(0)
+        num_negatives = negative_item_embs.size(0)
         
-        # if dist.is_initialized():
-        #     rank = dist.get_rank()
-        #     # 生成类别标签，每个样本的正样本索引为 rank*batch_size + i
-        #     labels = torch.arange(logits.size(0), device=user_embs.device) + rank * logits.size(0)
-        # else:
-        #     labels = torch.arange(logits.size(0), device=user_embs.device)
-
-        # # Cross Entropy Loss
-        # loss = F.cross_entropy(logits, labels)
-
+        all_item_embs = torch.cat([positive_item_embs.unsqueeze(1), 
+                                  negative_item_embs.unsqueeze(0).expand(batch_size, -1, -1)], dim=1)  # [B, 1+N, D]
+        
+        expanded_user_embs = user_embs.unsqueeze(1).expand(-1, 1+num_negatives, -1)  # [B, 1+N, D]
+        
+        logits = torch.sum(expanded_user_embs * all_item_embs, dim=2)  # [B, 1+N]
+        
+        labels = torch.zeros_like(logits)
+        labels[:, 0] = 1.0
+        
         # Focal Loss
         bce_loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
         probs = torch.sigmoid(logits)
@@ -146,17 +159,18 @@ class RecallTrainer(Trainer):
         alpha = 0.25
         alpha_t = torch.where(labels.bool(), alpha, 1-alpha)
         focal_weight = alpha_t * (1 - pt) ** gamma
-
+        
         loss = (focal_weight * bce_loss).mean()
-
-        return (loss, (user_embs, item_embs, all_embs, logits)) if return_outputs else loss
-
+        
+        outputs = (user_embs, positive_item_embs, negative_item_embs, logits)
+        return (loss, outputs) if return_outputs else loss
+    
 
 def train_recall_model(train_df, item_df, user_pos_items, output_dir, args):
     model, tokenizer = init_model(args)
     
     dataset = RecallDataset(train_df, item_df)
-    collator = RecallDataCollator(tokenizer)
+    collator = RecallDataCollator(tokenizer, item_df)
     
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -176,7 +190,6 @@ def train_recall_model(train_df, item_df, user_pos_items, output_dir, args):
     )
 
     trainer = RecallTrainer(
-        user_pos_items=user_pos_items,
         model=model,
         tokenizer=tokenizer,
         args=training_args,
@@ -185,12 +198,13 @@ def train_recall_model(train_df, item_df, user_pos_items, output_dir, args):
     )
     
     trainer.train()
+    
     return trainer
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", default="Qwen2.5-0.5B-instruct")  # Qwen2.5-0.5B-instruct  Qwen3-0.6B
+    parser.add_argument("--model_name", default="Qwen3-0.6B")  # Qwen2.5-0.5B-instruct  Qwen3-0.6B
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=1e-6)
@@ -206,22 +220,6 @@ def main():
     item_df['item_id'] = item_df['item_id'].astype('int64')
     print(f"Successfully load item data.",len(item_df))
 
-    # train_df = pd.read_csv(os.path.join(data_dir, 'train_title.csv'))
-    # test_df = pd.read_csv(os.path.join(data_dir, 'test_title.csv'))
-    # print(f"Successfully load train data and test data.",len(train_df), len(test_df))
-    
-    # train_df["city"] = train_df["city"].fillna("未知城市")
-    # test_df["city"] = test_df["city"].fillna("未知城市")
-    # # str_to_dict_cols = [
-    # #     "camp_id_list", "category_id_list", "category_name_list", 
-    # #     "follow_user_id_list", "comment_author_list",
-    # #     "click_50_seq__item_id", "click_50_seq__category",
-    # #     "click_50_seq__author", "click_50_seq__theme_id"
-    # # ]
-    # str_to_dict_cols = ['category_name_list', 'click_50_seq__category', 'click_50_seq__item_title']
-    # for col in str_to_dict_cols:
-    #     train_df[col] = train_df[col].apply(lambda x: literal_eval(x) if pd.notna(x) else {})
-    #     test_df[col] = test_df[col].apply(lambda x: literal_eval(x) if pd.notna(x) else {})
     train_df = pd.read_parquet(os.path.join(data_dir, 'train.parquet'), engine='pyarrow')
     test_df = pd.read_parquet(os.path.join(data_dir, 'test.parquet'), engine='pyarrow')
     print(f"Successfully load train data and test data.",len(train_df), len(test_df))
