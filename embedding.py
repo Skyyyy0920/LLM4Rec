@@ -11,28 +11,8 @@ from torch.utils.data import Dataset, DataLoader
 from utils import CATEGORY_MAPPING
 
 
-SYSTEM_USER_PROMPT = """你是一个用户表征编码器，将以下用户特征转换为适合推荐系统使用的高质量向量表示。
-请重点关注：
-- 时空特征（城市/活跃时间）
-- 行为强度（点击/收藏/购买频次）
-- 兴趣演化（近期点击类别序列）
-- 社交影响力（关注/粉丝比例）\n"""
-# """输出向量应能区分：
-# - 同一城市不同兴趣的用户
-# - 相似兴趣但消费能力不同的用户
-# - 短期兴趣与长期偏好的差异"""
-
-SYSTEM_ITEM_PROMPT = """你是一个内容表征编码器，需要将以下内容特征转化为适合推荐系统使用的高质量向量表示。
-请重点关注：
-- 内容核心特征（类型/标签/标题语义）
-- 用户互动模式（点赞/收藏/分享比例）
-- 作者权威性（身份+发布源）
-- 时效敏感性（发布时间与当前的时间差）\n"""
-# """输出向量应能区分：
-# - 同类内容的不同受欢迎程度
-# - 相同标签下的质量差异
-# - 短期爆款与长期优质内容
-# """
+SYSTEM_USER_PROMPT = """你是一个用户表征编码器，将以下用户特征转换为适合推荐系统使用的高质量表征向量。"""
+SYSTEM_ITEM_PROMPT = """你是一个内容表征编码器，将以下内容特征转化为适合推荐系统使用的高质量表征向量。"""
 
 def build_user_prompt(row):
     base_template = """用户是来自{city}的{gender}性，账户等级{growth_level}{new_user_tag}。
@@ -40,7 +20,8 @@ def build_user_prompt(row):
 用户关注{follow_cnt}人，拥有{follower_cnt}粉丝，收藏{favorite_cnt}内容。
 已购买{buy_camp_cnt}门课程，{category_name_list}。
 用户近期点击内容类别：{formatted_category_seq}
-近期点击内容标题：{formatted_item_title_seq}"""
+近期点击内容标题：{formatted_item_title_seq}
+根据以上用户特征生成综合表征向量："""
 
     def format_seq(seq):
         if len(seq) > 30:
@@ -109,7 +90,8 @@ def build_item_prompt(row):
 # 内容{home_mark}首页精选，{club_mark}广场精选。"""
     base_template = """内容标题为：{title}，一级标签为{category}。类型为{type}，发布于{pub_time}，{status}被推荐。
 作者身份为{author_status}，发布源为{publish}。
-内容获得{praise}点赞，{comment}评论，{collect}收藏，{share}分享。"""
+内容获得{praise}点赞，{comment}评论，{collect}收藏，{share}分享。
+根据以上内容特征生成综合表征向量："""
 
     pub_time = datetime.fromtimestamp(row['pub_time']).strftime("%Y-%m-%d")
     status = "已" if row['status'] else "未"
@@ -222,7 +204,7 @@ def generate_user_embs(
             ]
             texts = [tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False) for messages in messages_list]
 
-            model_inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(device)
+            model_inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
 
             # generated_ids = model.generate(**model_inputs, max_new_tokens=4096)
             # generated_ids = [
@@ -287,7 +269,7 @@ def generate_item_embs(
             ]
             texts = [tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False) for messages in messages_list]
 
-            model_inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(device)
+            model_inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
 
             # generated_ids = model.generate(**model_inputs, max_new_tokens=4096)
             # generated_ids = [
