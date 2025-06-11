@@ -15,11 +15,11 @@ SYSTEM_USER_PROMPT = """你是一个用户表征编码器，将以下用户特�
 SYSTEM_ITEM_PROMPT = """你是一个内容表征编码器，将以下内容特征转化为适合推荐系统使用的高质量表征向量。"""
 
 def build_user_prompt(row):
-    base_template = """用户是来自{city}的{gender}性，账户等级{growth_level}{new_user_tag}。
-最近活跃于周{week_day}{day_h}时，历史点击{item_cnt}次内容。
+    base_template = """用户是来自{city}的{age}岁{gender}性，账户等级{growth_level}{new_user_tag}。
+最近活跃于周{week_day}{day_h}时，历史创作{item_cnt}篇内容。
 用户关注{follow_cnt}人，拥有{follower_cnt}粉丝，收藏{favorite_cnt}内容。
 已购买{buy_camp_cnt}门课程，{category_name_list}。
-用户近期点击内容类别：{formatted_category_seq}
+近期点击内容类别：{formatted_category_seq}
 近期点击内容标题：{formatted_item_title_seq}
 根据以上用户特征生成综合表征向量："""
 
@@ -61,33 +61,30 @@ def build_user_prompt(row):
         gender = '女'
     else:
         gender = '未知'
-
+    
     prompt = base_template.format(
-        city=row["city"],
+        city=row['city'],
         gender=gender,
-        day_h=row["day_h"],
+        age=row['age'],
+        day_h=row['day_h'],
         week_day=week_day,
         is_new_user=new_user,
-        growth_level=f"{row["growth_level"]:.0f}",
+        growth_level=f"{row['growth_level']:.0f}",
         new_user_tag="(新用户)" if row['is_new_user'] == 1 else "",
         buy_camp_cnt=f"{row['buy_camp_cnt']:.0f}",
         item_cnt=f"{row['item_cnt']:.0f}",
         follow_cnt=f"{row['follow_cnt']:.0f}",
         follower_cnt=f"{row['follower_cnt']:.0f}",
         favorite_cnt=f"{row['favorite_cnt']:.0f}",
-        category_name_list=analyze_purchases(row["category_name_list"]),
-        formatted_category_seq=format_category_seq(row["click_50_seq__category"]),
-        formatted_item_title_seq=format_seq(row["click_50_seq__item_title"]),
+        category_name_list=analyze_purchases(row['category_name_list']),
+        formatted_category_seq=format_category_seq(row['click_50_seq__category']),
+        formatted_item_title_seq=format_seq(row['click_50_seq__item_title']),
     )
     
     return prompt
 
 
 def build_item_prompt(row):
-#     base_template = """内容类型为{type}，发布于{pub_time}，{status}被推荐。标题为：{title}，一级标签为{category}。
-# 作者身份为{author_status}，所属话题为{theme_id}，活动id为{activity}，发布源为{publish}。
-# 内容的点赞数为{praise}，评论数为{comment}，收藏数为{collect}，分享数为{share}。
-# 内容{home_mark}首页精选，{club_mark}广场精选。"""
     base_template = """内容标题为：{title}，一级标签为{category}。类型为{type}，发布于{pub_time}，{status}被推荐。
 作者身份为{author_status}，发布源为{publish}。
 内容获得{praise}点赞，{comment}评论，{collect}收藏，{share}分享。

@@ -1,32 +1,45 @@
 import os
 import torch
+import argparse
 import numpy as np
 import pandas as pd
 from modelscope import AutoModelForCausalLM, AutoTokenizer
-from main import generate_item_embs, generate_user_embs, compute_hit_rate, build_faiss_index_from_embeddings
+from embedding import build_item_prompt, build_user_prompt, generate_item_embs, generate_user_embs
+from utils import compute_hit_rate, build_faiss_index_from_embeddings
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, default="1151")
+    args = parser.parse_args()
+    print(args.ckpt)
+    
     data_dir = "/mnt/data/LLM4Rec/data"
-    item_df = pd.read_csv(os.path.join(data_dir, 'item_test.csv'))
+    item_df = pd.read_csv(os.path.join(data_dir, 'item_processed.csv'))
     item_df = item_df.dropna(subset=['publish_source'])
     item_df['item_id'] = item_df['item_id'].astype('int64')
-    test_df = pd.read_csv(os.path.join(data_dir, 'test.csv'))
+    print(f"Successfully load item data.",len(item_df))
 
-    model = AutoModelForCausalLM.from_pretrained("/mnt/data/LLM4Rec/model/fine-tune/Qwen2.5-0.5B/cosine/1epoch/checkpoint-9211")
-    tokenizer = AutoTokenizer.from_pretrained("/mnt/data/LLM4Rec/model/fine-tune/Qwen2.5-0.5B/cosine/1epoch/checkpoint-9211")
+    test_df = pd.read_parquet(os.path.join(data_dir, 'test.parquet'), engine='pyarrow')
+
+    model = AutoModelForCausalLM.from_pretrained(f"/mnt/data/LLM4Rec/model/fine-tune/Qwen3-0.6B/constant/v4_1epoch_2e-06_15/checkpoint-{args.ckpt}")
+    tokenizer = AutoTokenizer.from_pretrained(f"/mnt/data/LLM4Rec/model/fine-tune/Qwen3-0.6B/constant/v4_1epoch_2e-06_15/checkpoint-{args.ckpt}")
     model.to('cuda')
     
-    weights = torch.load(f"/mnt/data/LLM4Rec/model/fine-tune/Qwen2.5-0.5B/checkpoint-114514/pytorch_model.bin")
-    fixed_weights = {k.replace("module.", ""): v for k, v in weights.items()}
-    missing_keys, unexpected_keys = model.load_state_dict(fixed_weights, strict=False)
+    # model = AutoModelForCausalLM.from_pretrained(f"Qwen/Qwen3-0.6B")
+    # tokenizer = AutoTokenizer.from_pretrained(f"Qwen/Qwen3-0.6B")
+    # model.to('cuda')
+    
+    # model = AutoModelForCausalLM.from_pretrained(f"Qwen/Qwen2.5-0.5B-instruct")
+    # tokenizer = AutoTokenizer.from_pretrained(f"Qwen/Qwen2.5-0.5B-instruct")
+    # model.to('cuda')
 
     item_index_ids, item_embs = generate_item_embs(
         df=item_df,
         model=model,
         tokenizer=tokenizer,
         device='cuda',
-        batch_size=128,
+        batch_size=32,
         use_amp=True
     )
 
@@ -41,7 +54,7 @@ def main():
         model=model,
         tokenizer=tokenizer,
         device='cuda',
-        batch_size=32,
+        batch_size=16,
         use_amp=True
     )
     
@@ -54,27 +67,8 @@ def main():
         top_k=200,
         batch_size=512
     )
-
-    # print("\n===== 召回结果分析 =====")
-    for sample in sampled_recalls:
-        user_id = sample["user_id"]
-        print(f"\n用户 {user_id} 的召回结果：")
-        
-        # 获取召回商品的详细信息
-        recalled_ids = sample["recalled_items"]
-        recalled_items = item_df[item_df['item_id'].astype(str).isin(recalled_ids)]
-        print("召回商品类别分布：")
-        print(recalled_items['category'].value_counts())
-        
-        # 获取真实交互商品信息
-        gt_ids = sample["ground_truth"]
-        gt_ids = list(str(gt_ids))
-
-        gt_items = item_df[item_df['item_id'].astype(str).isin(gt_ids)]
-        print("\n真实交互商品类别：")
-        print(gt_items['category'].unique())
+    print(hit_rate)
     
-    print(f"Hit Rate @200: {hit_rate:.4f}")
 
 if __name__ == "__main__":
     main()

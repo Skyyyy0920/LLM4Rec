@@ -1,13 +1,7 @@
 import os
-import torch
 import faiss
-import datetime
-import logging
 import numpy as np
-import pandas as pd
 from tqdm import tqdm
-from pathlib import Path
-from modelscope import AutoModelForCausalLM, AutoTokenizer
 
 
 CATEGORY_MAPPING = {
@@ -208,51 +202,3 @@ def compute_hit_rate(
     hit_rate = total_hits / total_gt_items if total_gt_items > 0 else 0
     
     return hit_rate, sampled_recalls
-
-
-def init_model(size):
-    model_name = f"Qwen/Qwen2.5-{size}B-instruct"
-    # from transformers import AutoModelForCausalLM, AutoTokenizer
-    # model_name = "alibaba-pai/DistilQwen2.5-R1-7B"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype="auto",
-        device_map="auto"
-    )
-    
-    ds_config = {
-        "tensor_parallel": {"tp_size": 1},
-        "dtype": "fp16",
-        "replace_with_kernel_inject": True
-    }
-    
-    ds_model = deepspeed.init_inference(
-        model=model,
-        config=ds_config,
-    )
-    device = next(model.parameters()).device
-    
-    return ds_model, tokenizer, device
-
-
-def setup_logger(log_dir="/mnt/data/LLM4Rec/logs"):
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
-    
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = Path(log_dir) / f"run.log"
-    
-    logger = logging.getLogger("LLM4RecEvaluation")
-    logger.setLevel(logging.INFO)
-    
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    
-    return logger
