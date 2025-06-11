@@ -12,6 +12,7 @@ from pathlib import Path
 from ast import literal_eval
 from odps import ODPS
 from odps.accounts import AliyunAccount
+from torch.autograd import Function
 from transformers import Trainer, TrainingArguments
 from modelscope import AutoModelForCausalLM, AutoTokenizer
 from torch.utils.data import Dataset
@@ -87,6 +88,52 @@ class RecallDataCollator:
         }
 
 
+class AllGather(Function):
+    @staticmethod
+    def forward(ctx, input, dim=0):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        
+        ctx.dim = dim
+        ctx.world_size = world_size
+        ctx.rank = rank
+        
+        input_size = list(input.size())
+        total_size = input_size[dim] * world_size
+        output_size = input_size.copy()
+        output_size[dim] = total_size
+        output = input.new_empty(output_size)
+        
+        split_sizes = [input_size[dim]] * world_size
+        gather_list = list(output.split(split_sizes, dim=dim))
+        
+        dist.all_gather(gather_list, input.contiguous())
+        
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        dim = ctx.dim
+        world_size = ctx.world_size
+        
+        input_size = list(grad_output.size())
+        local_size = input_size[dim] // world_size
+        grad_parts = list(grad_output.split(local_size, dim=dim))
+        
+        recv_shape = list(grad_output.size())
+        recv_shape[dim] = local_size
+        recv_grads = [torch.empty(recv_shape, 
+                                 dtype=grad_output.dtype, 
+                                 device=grad_output.device) 
+                     for _ in range(world_size)]
+
+        dist.all_to_all(recv_grads, grad_parts)
+        
+        grad_input = torch.stack(recv_grads).sum(dim=0)
+        
+        return grad_input, None, None
+
+
 class RecallTrainer(Trainer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -113,11 +160,15 @@ class RecallTrainer(Trainer):
         )
         negative_item_embs = negative_item_outputs.hidden_states[-1].mean(dim=1)  # [N, D]    
         
-        # all_item_embs = torch.cat([positive_item_embs.unsqueeze(1), negative_item_embs.unsqueeze(0).expand(batch_size, -1, -1)], dim=1)  # [B, 1+N, D]
-        # expanded_user_embs = user_embs.unsqueeze(1).expand(-1, 1+num_negatives, -1)  # [B, 1+N, D]
-        # logits = torch.sum(expanded_user_embs * all_item_embs, dim=2)  # [B, 1+N]
+        # 收集所有GPU的负样本embeddings（支持梯度回传）
+        if dist.is_initialized():
+            # 使用支持梯度回传的自定义 AllGather
+            all_neg_embs = AllGather.apply(negative_item_embs)
+        else:
+            all_neg_embs = negative_item_embs
+        
         positive_logits = (user_embs * positive_item_embs).sum(dim=1, keepdim=True)    # [B, 1]
-        negative_logits = torch.matmul(user_embs, negative_item_embs.T)                # [B, N]
+        negative_logits = torch.matmul(user_embs, all_neg_embs.T)                # [B, N]
         logits = torch.cat([positive_logits, negative_logits], dim=1)                  # [B, 1+N]
         
         labels = torch.zeros_like(logits)
